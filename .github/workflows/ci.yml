@@ -1,0 +1,18 @@
+name: ci
+on:
+  pull_request:
+  merge_group:
+concurrency:
+  group: ${{ github.event_name == 'merge_group' && vars.CANCEL == 'true' && format('mq-{0}', github.workflow) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'merge_group' && vars.CANCEL == 'true' }}
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sleep 90
+      - name: fail on FAIL file (merge_group only)
+        if: github.event_name == 'merge_group'
+        run: |
+          if ls files/FAIL* >/dev/null 2>&1; then echo FAIL present; exit 1; fi
+          echo ok
