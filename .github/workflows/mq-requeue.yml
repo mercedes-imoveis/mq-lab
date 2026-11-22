@@ -3,7 +3,7 @@ name: mq-requeue
 # (pull_request_target / workflow_run) and never checks out PR code.
 on:
   pull_request_target:
-    types: [dequeued]
+    types: [dequeued, closed]
   workflow_run:
     workflows: [ci]
     types: [completed]

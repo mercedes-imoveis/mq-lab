@@ -104,6 +104,11 @@ const main = () => {
   if (dry) return 0;
 
   let failedExit = 0;
+  // One requeue at a time. Putting every removed PR back together rebuilds the same failing group and the queue
+  // removes the innocents first again (bench 22/11: #76 and #77 were removed twice and wrongly accused). A group of
+  // one gives an exact verdict. Wait while a PR the robot put back is still in the queue.
+  const inFlight = queueEntries.some((p) => ledger.requeues.some((r) => r.pr === p.number && r.headSha === p.headRefOid));
+  result.requeue = inFlight ? [] : result.requeue.slice(0, 1);
   for (const a of result.alerts) {
     console.log(`::error::merge-queue-robot alert ${JSON.stringify(a)}`);
     failedExit = 1;
