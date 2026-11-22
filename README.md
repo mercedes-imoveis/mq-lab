@@ -1,13 +1,54 @@
-# mq-lab: merge queue experiment (throwaway, safe to delete)
+# mq-lab: merge queue bench (throwaway, safe to delete)
 
-Workflow: PR build and merge_group build, 1 job "gate" (sleep 90). Runner time per build is about 94s. Ruleset "main-mq" is set to disabled.
+Public repo, free Actions. Workflow `ci`: `pull_request`, `merge_group` and `push` on main. Job `heavy` (sleep 90, fails on `files/FAIL*` in `merge_group`) plus aggregator job `gate` (the required check). Repo variables: `MODE` (A = workflow-level `cancel-in-progress` on merge_group; B = job-level `concurrency` on `heavy` with `cancel-in-progress: false`; unset = no limit) and `BUILD_SECS` (default 90). Ruleset `main-mq` is **disabled**, bench variables removed, `allow_auto_merge` back to false.
 
-| Round | Config | PRs | Builds (merge_group) | Complete | Cancelled | Failed | Runner s (merge_group) | Enqueue to main | Entered main |
-|---|---|---|---|---|---|---|---|---|---|
-| A | ALLGREEN, no cancel, build 5, min 1 | #1-#4 | 4 | 4 | 0 | 0 | 379 | 2m28s | 4 of 4 |
-| B | HEADGREEN, cancel-in-progress, min 4, wait 5 | #5-#8 | 4 | 1 | 3 | 0 | 96 | 2m33s | 4 of 4, together |
-| C | B config, PR #11 (3rd) adds files/FAIL* | #9-#12 | 10 | 1 | 6 | 3 | 376 | 9m14s | only #12 (after 3 rebuilds); #9, #10, #11 removed (failed_checks) |
+All rounds use `grouping_strategy: HEADGREEN`, SQUASH, except A (ALLGREEN). A to C come from the first experiment (22/11 morning); D1 to G and E are this bench (22/11, BRT afternoon). "Billed min" is computed from job start/end (ceil to the minute per job), not from the billing API.
 
-Findings
-- B: cancelled builds of #5-#7 did not remove those PRs; the head build (#8, cumulative) passed and the whole group merged. Main tip = the tested head commit (f174b0b1).
-- C: a cancelled build counts as a failed check for the entry (state UNMERGEABLE). When the head build failed, the queue removed the first entry of the group (#9, innocent), rebuilt the rest, the head failed again, removed #10, and so on, until #11 (culprit) was removed. Each round cost a full head build.
+| Round | Config | PRs | merge_group builds | Complete | Cancelled | Failed | Runner s (job time, incl. cancelled) | Billed min (my estimate: ceil per job) | Enqueue to main | Entered main |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A (prev) | ALLGREEN, no cancel, build 5, min 1 | #1-#4 | 4 | 4 | 0 | 0 | 379 | - | 2m28s | 4/4 |
+| B (prev) | HEADGREEN, cancel (A), build 5, min 4, wait 5 | #5-#8 | 4 | 1 | 3 | 0 | 96 | - | 2m33s | 4/4 together |
+| C (prev) | B + #11 adds FAIL file | #9-#12 | 10 | 1 | 6 | 3 | 376 | - | 9m14s | #12 only |
+| D1a | design A, build 1, min 1, 4 PRs at once | #13-#16 | 4 | 4 | 0 | 0 | 398 | 12 | 9m18s (serial, one PR per build) | 4/4, one at a time |
+| D1b | design A, build 10, min 1, 4 PRs at once | #17-#20 | 4 | 1 | 3 | 0 | 102 | 5 | 2m34s | 4/4 together |
+| D2 | design A, build 10, min 4, wait 5, 1 PR / 30 s | #21-#24 | 4 | 1 | 3 | 0 | 177 | 7 | 3m57s | 4/4 together |
+| D2b | design A, build 10, min 4, wait 5, 2 PRs / 30 s | #25-#26 | 2 | 1 | 1 | 0 | 147 | 5 | 5m35s (merge held ~5 min) | 2/2 together |
+| D3a | design A, build 10, min 1, 1 PR / 60 s, build 90 s | #27-#32 | 6 | 1 | 5 | 0 | 404 | 16 | 7m55s (all at the end; avg per PR 5m21s) | 6/6 together |
+| D3b | design B, build 10, min 1, 1 PR / 60 s, build 90 s | #33-#38 | 6 | 5 | 1 | 0 | 550 | 18 | 8m52s (first PR 2m19s; avg per PR 3m02s) | 6/6 in 5 merges |
+| F | design A, build 10, min 1, timeout 60 (lowered to 5 at 15:28), #41 = FAIL | #39-#42 | 10 | 0 | 6 | 4 | 414 | 18 | never (26 min until all out) | 0/4 (culprit and innocents removed) |
+| G | F again, timeout 5, #45 = FAIL | #43-#46 | 7 | 0 | 5 | 2 | 207 | 10 | never (>30 min, I closed #44-#46) | 0/4 at the time I stopped |
+| E | gh pr merge tests, design A, build 10, min 1 | #47,#48,#50 | 3 | 2 | 1 | 0 | 202 | 8 | 2m46s-4m38s | 3/3 (#49 not enqueued) |
+
+Check (all merge_group runs; 64 = 18 from A-C + 46 here): `{"cancelled":34,"failure":9,"success":21}`, EXIT=0.
+
+## Answers (spec section 13, questions 1 to 5)
+
+1. **Does `min_entries_to_merge` hold the build dispatch? No.** D2 and D2b: the first merge_group run was created 19 s after the first enqueue. The minimum only holds the merge into main: D2b (2 PRs, min 4, wait 5) had the head build green at about 2m30s and merged at 5m35s after the first enqueue. With the minimum met (D2, 4th PR at 90 s) the merge came right after the head build.
+2. **Does `max_entries_to_build: 1` turn batching off? Yes.** D1a: 4 PRs at once gave 4 complete builds, one per entry, 398 s of runner, 9m18s to the last merge, each PR merged alone and main tip = the last tested SHA. D1b (build 10): 1 complete + 3 cancelled, 102 s of runner, 2m34s, all 4 merged together.
+3. **Design A or B (6 PRs, 1 per 60 s, build 90 s)?** A: 1 complete + 5 cancelled (cancelled after 45 to 80 s), 404 s of runner, about 16 billed min, all 6 merged together at 7m55s (average wait per PR 5m21s). B: 5 complete + 1 cancelled, 550 s, about 18 billed min, 5 merges, first PR in main at 2m19s (average per PR 3m02s). A is cheaper (about 12% less in billed minutes, 27% less in runner seconds) and slower per PR when arrivals are spaced at about the build length; B is cheaper only when arrivals are denser than the build (not measured here).
+4. **GITHUB_TOKEN enqueue:** not tested here (robot task, T3).
+5. **Does merge_group read `actions/cache` saved by a `push` on main? Yes**, through `restore-keys`. The push run saved `lab-cache-<main sha>`; merge_group (and pull_request) runs logged "Cache restored from key: lab-cache-<main sha>" (`cache-hit` is false because only the prefix matched, which is the expected value for restore-keys). Examples: run 45033333409 and 45035090744 (see the "report cache" step).
+
+D4 (main tip = tested SHA): yes in every green round. Each PR's squash commit SHA equals the head_sha of one merge_group run, and the main tip after the round equals the head build's SHA (D1a: 4 PRs, 4 SHAs matched; D1b 26fb00bb; D2 ccdae6f2; D2b 88d84923; D3a d8acc8a0; D3b 725b14cf).
+
+## Findings that change the plan
+
+- **A cancelled run can leave no check at all.** When the workflow-level cancel hits a run before its jobs start (0 s runs in F: `bdd3538f`, `d0720b36`), the entry has no `gate` check and stays `AWAITING_CHECKS`. If the head build then fails, the cascade stalls: F stalled 14 min (until I changed the ruleset timeout from 60 to 5 at 15:28, then moved 2 min later), G stalled 19 min (moved 3.5 min after I rewrote the ruleset at 16:01; stalled again at 16:07 for 7+ min until I stopped). A timeout of 5 or 6 min did not remove the entries by itself; only a ruleset write seemed to wake the queue (2 cases, not proven as the cause).
+- **Removal order is not "culprit last".** F: removals in the order #39, #40, #41 (culprit), #42; the innocent #42 was removed last because its rebuild still contained #41's file. With build 10 the "last removed = suspect" rule of the spec would blame #42. In G, #43 went first. The robot cannot pick the suspect by position; it has to read the failed run (which files/commits are in the group) or use the cap of 1 requeue per SHA.
+- **Final state of F:** main has 0 `FAIL*` files (red proof) and none of the 4 PRs entered; the queue took 26 min and 10 merge_group runs (4 failed, 6 cancelled) to empty.
+- **Cancelled runs are not free:** a run cancelled 3 s after the start still bills 1 min per started job (D1b run with 3 s: 2 jobs = 2 billed min in my estimate).
+- **gh pr merge:** with `allow_auto_merge` false, `gh pr merge N --squash` and `--auto` both fail: "GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)". With it true, `gh pr merge N --squash` on a green PR enqueues it (the CLI prints "The merge strategy for main is set by the merge queue" and the PR shows as QUEUED); `--auto` on a PR with checks still pending sets `autoMergeRequest`, and the PR entered the queue by itself about 1 min later when its check went green (E4, #50: auto set 16:17:38, queued 16:19:31, merged 16:22:18). `--auto` on an already green PR also enqueues at once (#48).
+- Actions are pinned by SHA (org policy): `actions/checkout` v4.2.2, `actions/cache/save` and `restore` v4.2.4.
+
+## Runs (merge_group)
+
+- D1a: [45032211494](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45032211494), [45032420966](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45032420966), [45032620689](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45032620689), [45032817389](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45032817389)
+- D1b: [45033333409](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45033333409), [45033334790](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45033334790), [45033337082](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45033337082), [45033338002](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45033338002)
+- D2: [45033859494](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45033859494), [45033906662](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45033906662), [45033949430](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45033949430), [45033973632](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45033973632)
+- D2b: [45034487673](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45034487673), [45034540307](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45034540307)
+- D3a: [45035090744](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45035090744), [45035185906](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45035185906), [45035259538](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45035259538), [45035364018](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45035364018), [45035437031](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45035437031), [45035542480](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45035542480)
+- D3b: [45036098589](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45036098589), [45036199067](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45036199067), [45036291099](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45036291099), [45036391994](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45036391994), [45036469493](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45036469493), [45036587785](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45036587785)
+- F: [45037217329](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45037217329), [45037218812](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45037218812), [45037220149](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45037220149), [45037221425](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45037221425), [45038691349](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45038691349), [45038692806](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45038692806), [45038694126](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45038694126), [45039195639](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45039195639), [45039196974](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45039196974), [45039408406](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45039408406)
+- G: [45039941840](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45039941840), [45039943603](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45039943603), [45039945160](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45039945160), [45039946851](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45039946851), [45041851657](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45041851657), [45041852939](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45041852939), [45041854552](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45041854552)
+- E: [45043011924](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45043011924), [45043013610](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45043013610), [45043241964](https://github.com/mercedes-imoveis/mq-lab/actions/runs/45043241964)
+- A to C: see the first experiment's runs (45026860110 and 45026864435 for A; 45027304453, 45027305731, 45027307568, 45027309333 for B; 45027719987, 45027921827, 45028120346, 45028321658 for C).
