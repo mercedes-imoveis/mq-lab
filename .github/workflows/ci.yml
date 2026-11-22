@@ -2,17 +2,56 @@ name: ci
 on:
   pull_request:
   merge_group:
+  push:
+    branches: [main]
+# MODE (repo variable): A = workflow-level cancel-in-progress on merge_group;
+# B = job-level concurrency on the heavy job (cancel-in-progress false); anything else = no limit.
 concurrency:
-  group: ${{ github.event_name == 'merge_group' && vars.CANCEL == 'true' && format('mq-{0}', github.workflow) || format('run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'merge_group' && vars.CANCEL == 'true' }}
+  group: ${{ github.event_name == 'merge_group' && vars.MODE == 'A' && format('mq-{0}', github.workflow) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'merge_group' && vars.MODE == 'A' }}
 jobs:
-  gate:
+  heavy:
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.event_name == 'merge_group' && vars.MODE == 'B' && 'mq-heavy' || format('heavy-{0}', github.run_id) }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - run: sleep 90
+      - name: seed cache (push on main only)
+        if: github.event_name == 'push'
+        run: mkdir -p .labcache && date -u > .labcache/stamp
+      - name: save cache (push on main only)
+        if: github.event_name == 'push'
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: .labcache
+          key: lab-cache-${{ github.sha }}
+      - name: restore cache (pull_request and merge_group)
+        id: cache
+        if: github.event_name != 'push'
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: .labcache
+          key: lab-cache-nomatch-${{ github.sha }}
+          restore-keys: lab-cache-
+      - name: report cache
+        if: github.event_name != 'push'
+        run: |
+          echo "CACHE_EVENT=${{ github.event_name }} HIT=${{ steps.cache.outputs.cache-hit }} MATCHED=${{ steps.cache.outputs.cache-matched-key }}"
+          ls .labcache 2>/dev/null || echo "no .labcache dir"
+      - name: build (sleep)
+        if: github.event_name != 'push'
+        run: sleep ${{ vars.BUILD_SECS || 90 }}
       - name: fail on FAIL file (merge_group only)
         if: github.event_name == 'merge_group'
         run: |
           if ls files/FAIL* >/dev/null 2>&1; then echo FAIL present; exit 1; fi
           echo ok
+  gate:
+    needs: heavy
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "heavy=${{ needs.heavy.result }}"
+          test "${{ needs.heavy.result }}" = "success"
