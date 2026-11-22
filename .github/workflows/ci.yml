@@ -4,17 +4,16 @@ on:
   merge_group:
   push:
     branches: [main]
-# MODE (repo variable): A = workflow-level cancel-in-progress on merge_group;
-# B = job-level concurrency on the heavy job (cancel-in-progress false); anything else = no limit.
-concurrency:
-  group: ${{ github.event_name == 'merge_group' && vars.MODE == 'A' && format('mq-{0}', github.workflow) || format('run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'merge_group' && vars.MODE == 'A' }}
+# Design A': NO workflow-level concurrency. Job "heavy" has a JOB-level concurrency group with
+# cancel-in-progress (merge_group only, when vars.MODE == 'AP'). Job "gate" (the required check) runs
+# with if: always() and ALWAYS reports; it succeeds only when heavy == success.
+# MODE=AP: job-level cancel; anything else: no limit (factory design).
 jobs:
   heavy:
     runs-on: ubuntu-latest
     concurrency:
-      group: ${{ github.event_name == 'merge_group' && vars.MODE == 'B' && 'mq-heavy' || format('heavy-{0}', github.run_id) }}
-      cancel-in-progress: false
+      group: ${{ github.event_name == 'merge_group' && vars.MODE == 'AP' && 'mq-heavy' || format('heavy-{0}', github.run_id) }}
+      cancel-in-progress: ${{ github.event_name == 'merge_group' && vars.MODE == 'AP' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: seed cache (push on main only)
